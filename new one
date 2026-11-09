@@ -1,0 +1,983 @@
+/*
+  SOIL PROBE — 1.3" OLED VERSION
+  Converted from the uploaded Soil Probe web app.
+
+  Target:
+    - Arduino-compatible board
+    - 1.3" 128x64 I2C OLED using SH1106
+    - DS18B20 temperature probe
+    - Analog pH interface
+    - HX711 + load cell for compaction/cone index
+
+  Libraries to install in Arduino IDE:
+    1. U8g2
+    2. OneWire
+    3. DallasTemperature
+    4. HX711
+
+  DISPLAY:
+    Default is SH1106 128x64 I2C.
+    If your 1.3" OLED is SSD1306 instead, change the constructor
+    near the top to the SSD1306 constructor shown in the comment.
+
+  CONTROLS:
+    NEXT_PIN   = cycle Temperature / pH / Compaction
+    ACTION_PIN = take reading / start push / next 5 cm
+    STOP_PIN   = stop push / zero load cell
+    HOLD STOP  = pause/resume the dancing Lorax
+
+  IMPORTANT:
+    The pH voltage-to-pH relationship is different for different
+    pH boards/probes. Calibrate PH_SLOPE and PH_OFFSET before using
+    the pH value scientifically.
+*/
+
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "HX711.h"
+
+// ---------------- DISPLAY ----------------
+
+// 1.3" common OLED: SH1106 128x64 I2C
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+// If yours is SSD1306, use this instead:
+// U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------------- PINS ----------------
+
+// Change these to match your wiring.
+const int TEMP_PIN   = 2;
+const int PH_PIN     = A0;
+const int HX_DOUT    = 4;
+const int HX_SCK     = 5;
+
+const int NEXT_PIN   = 6;
+const int ACTION_PIN = 7;
+const int STOP_PIN   = 8;
+
+// ---------------- SENSOR OBJECTS ----------------
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+HX711 scale;
+
+// ---------------- PH CALIBRATION ----------------
+
+const float PH_SLOPE  = -5.70;
+const float PH_OFFSET = 21.34;
+
+// ---------------- LOAD CELL CALIBRATION ----------------
+
+float LOAD_CELL_CAL = 420.0f;
+
+// ---------------- UI ----------------
+
+enum Screen {
+  SCREEN_TEMP,
+  SCREEN_PH,
+  SCREEN_COMP
+};
+
+Screen selectedScreen = SCREEN_TEMP;
+
+bool pushing = false;
+bool zeroed = false;
+
+float temperatureC = NAN;
+float phValue = NAN;
+float currentKpa = NAN;
+float peakKpa = NAN;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastDisplay = 0;
+unsigned long pushTimer = 0;
+unsigned long splashStart = 0;
+
+// ---------------- DANCING LORAX ----------------
+
+bool loraxPaused = false;
+unsigned long loraxFrameTime = 0;
+uint8_t loraxFrame = 0;
+
+const unsigned long LORAX_FRAME_MS = 180;
+
+const int LORAX_X = 106;
+const int LORAX_Y = 45;
+
+const unsigned char loraxFrames[4][8] PROGMEM = {
+  {0b00111100,0b01111110,0b11011011,0b11111111,
+   0b01111110,0b00111100,0b01000010,0b10000001},
+
+  {0b00111100,0b01111110,0b11011011,0b11111111,
+   0b01111110,0b00111100,0b10000001,0b01000010},
+
+  {0b00111100,0b01111110,0b11111111,0b11011011,
+   0b01111110,0b00111100,0b01000010,0b10000001},
+
+  {0b00111100,0b01111110,0b11111111,0b11011011,
+   0b01111110,0b00111100,0b10000001,0b01000010}
+};
+
+const unsigned long SENSOR_INTERVAL = 1000;
+const unsigned long PUSH_INTERVAL = 150;
+
+// ---------------- READING HISTORY ----------------
+
+const int HISTORY_SIZE = 20;
+
+float tempHistory[HISTORY_SIZE];
+float phHistory[HISTORY_SIZE];
+int historyCount = 0;
+
+unsigned long readingNumber = 0;
+
+// ---------------- COMPACTION PROFILE ----------------
+
+const int MAX_DEPTH_POINTS = 25;
+
+float depthPoints[MAX_DEPTH_POINTS];
+float peakPoints[MAX_DEPTH_POINTS];
+int depthCount = 0;
+
+float currentDepth = 0;
+
+// ---------------- BUTTON STATE ----------------
+
+bool lastNextState = HIGH;
+bool lastActionState = HIGH;
+bool lastStopState = HIGH;
+
+unsigned long lastButtonTime = 0;
+const unsigned long DEBOUNCE = 180;
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(NEXT_PIN, INPUT_PULLUP);
+  pinMode(ACTION_PIN, INPUT_PULLUP);
+  pinMode(STOP_PIN, INPUT_PULLUP);
+
+  Wire.begin();
+
+  display.begin();
+  display.setContrast(255);
+
+  tempSensor.begin();
+
+  scale.begin(HX_DOUT, HX_SCK);
+  scale.set_scale(LOAD_CELL_CAL);
+
+  splashStart = millis();
+
+  drawSplash();
+
+  delay(1200);
+
+  if (scale.is_ready()) {
+    scale.tare();
+    zeroed = true;
+  }
+
+  readSensors();
+  render();
+}
+
+// ================================================================
+// MAIN LOOP
+// ================================================================
+
+void loop() {
+  handleButtons();
+
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL && !pushing) {
+    lastSensorRead = millis();
+    readSensors();
+    render();
+  }
+
+  if (pushing && millis() - pushTimer >= PUSH_INTERVAL) {
+    pushTimer = millis();
+    readCompaction();
+    render();
+  }
+
+  if (millis() - lastDisplay >= 250) {
+    lastDisplay = millis();
+    render();
+  }
+}
+
+// ================================================================
+// SENSOR READING
+// ================================================================
+
+void readSensors() {
+  tempSensor.requestTemperatures();
+
+  float t = tempSensor.getTempCByIndex(0);
+
+  if (t != DEVICE_DISCONNECTED_C && t > -55 && t < 125) {
+    temperatureC = t;
+  }
+
+  int raw = analogRead(PH_PIN);
+
+  const float ADC_REFERENCE = 5.0;
+
+  float voltage = raw * ADC_REFERENCE / 1023.0;
+
+  phValue = PH_SLOPE * voltage + PH_OFFSET;
+
+  if (phValue < 0 || phValue > 14) {
+    phValue = NAN;
+  }
+
+  addHistory();
+
+  readingNumber++;
+
+  Serial.print("READING,");
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(temperatureC, 1);
+  Serial.print(",");
+  Serial.println(phValue, 2);
+}
+
+void readCompaction() {
+  if (!scale.is_ready()) {
+    return;
+  }
+
+  float force = scale.get_units(3);
+
+  if (force < 0) {
+    force = 0;
+  }
+
+  const float CONE_AREA_M2 = 0.0001f;
+
+  float forceN = force;
+
+  currentKpa = (forceN / CONE_AREA_M2) / 1000.0f;
+
+  if (isnan(peakKpa) || currentKpa > peakKpa) {
+    peakKpa = currentKpa;
+  }
+
+  if (depthCount < MAX_DEPTH_POINTS) {
+    depthPoints[depthCount] = currentDepth;
+
+    peakPoints[depthCount] = max(
+      depthCount == 0 ? 0.0f : peakPoints[depthCount],
+      currentKpa
+    );
+
+    depthCount++;
+  }
+
+  Serial.print("PUSH,");
+  Serial.print(currentDepth, 0);
+  Serial.print(",");
+  Serial.println(currentKpa, 0);
+}
+
+void addHistory() {
+  if (historyCount < HISTORY_SIZE) {
+    tempHistory[historyCount] = temperatureC;
+    phHistory[historyCount] = phValue;
+    historyCount++;
+    return;
+  }
+
+  for (int i = 1; i < HISTORY_SIZE; i++) {
+    tempHistory[i - 1] = tempHistory[i];
+    phHistory[i - 1] = phHistory[i];
+  }
+
+  tempHistory[HISTORY_SIZE - 1] = temperatureC;
+  phHistory[HISTORY_SIZE - 1] = phValue;
+}
+
+// ================================================================
+// BUTTONS
+// ================================================================
+
+void handleButtons() {
+  if (millis() - lastButtonTime < DEBOUNCE) {
+    return;
+  }
+
+  bool nextState = digitalRead(NEXT_PIN);
+  bool actionState = digitalRead(ACTION_PIN);
+  bool stopState = digitalRead(STOP_PIN);
+
+  static unsigned long lastStopPress = 0;
+
+  if (lastNextState == HIGH && nextState == LOW) {
+    selectedScreen = (Screen)((selectedScreen + 1) % 3);
+    lastButtonTime = millis();
+    render();
+  }
+
+  if (lastActionState == HIGH && actionState == LOW) {
+    lastButtonTime = millis();
+
+    if (selectedScreen == SCREEN_COMP) {
+      if (!pushing) {
+        startPush();
+      } else {
+        nextDepth();
+      }
+    } else {
+      takeReading();
+    }
+
+    render();
+  }
+
+  if (lastStopState == HIGH && stopState == LOW) {
+    lastButtonTime = millis();
+
+    if (selectedScreen == SCREEN_COMP && pushing) {
+      stopPush();
+    } else {
+      unsigned long pressedAt = millis();
+
+      while (
+        digitalRead(STOP_PIN) == LOW &&
+        millis() - pressedAt < 1000
+      ) {
+        delay(10);
+      }
+
+      if (millis() - pressedAt >= 900) {
+        loraxPaused = !loraxPaused;
+      } else {
+        zeroLoadCell();
+      }
+    }
+
+    render();
+  }
+
+  lastNextState = nextState;
+  lastActionState = actionState;
+  lastStopState = stopState;
+}
+
+void takeReading() {
+  readSensors();
+}
+
+void startPush() {
+  pushing = true;
+  currentDepth = 0;
+  peakKpa = NAN;
+  depthCount = 0;
+
+  Serial.println("PUSH_START");
+}
+
+void nextDepth() {
+  currentDepth += 5.0;
+
+  Serial.print("DEPTH,");
+  Serial.println(currentDepth, 0);
+}
+
+void stopPush() {
+  pushing = false;
+
+  Serial.println("PUSH_STOP");
+}
+
+void zeroLoadCell() {
+  if (pushing) {
+    return;
+  }
+
+  if (scale.is_ready()) {
+    scale.tare();
+    zeroed = true;
+  }
+
+  Serial.println("ZERO");
+
+  drawToast("LOAD CELL ZEROED");
+  delay(600);
+}
+
+// ================================================================
+// DISPLAY RENDERING
+// ================================================================
+
+void render() {
+  display.clearBuffer();
+
+  updateLorax();
+
+  drawHeader();
+
+  if (selectedScreen == SCREEN_TEMP) {
+    drawTemperatureScreen();
+  } else if (selectedScreen == SCREEN_PH) {
+    drawPHScreen();
+  } else {
+    drawCompactionScreen();
+  }
+
+  drawFooter();
+
+  display.sendBuffer();
+}
+
+void drawHeader() {
+  display.setFont(u8g2_font_6x10_tf);
+
+  display.setCursor(0, 9);
+  display.print("SOIL PROBE");
+
+  display.setCursor(91, 9);
+  display.print("LIVE");
+
+  display.drawDisc(86, 6, 2);
+}
+
+void drawFooter() {
+  display.drawHLine(0, 55, 128);
+
+  display.setFont(u8g2_font_5x8_tf);
+
+  display.setCursor(2, 63);
+
+  if (selectedScreen == SCREEN_TEMP) {
+    display.print("NEXT  pH  ACTION=READ");
+  } else if (selectedScreen == SCREEN_PH) {
+    display.print("NEXT  COMP  ACTION=READ");
+  } else {
+    if (pushing) {
+      display.print("ACTION=+5cm  STOP=END");
+    } else {
+      display.print("ACTION=PUSH  STOP=ZERO");
+    }
+  }
+}
+
+void drawTemperatureScreen() {
+  drawTab("TEMPERATURE");
+
+  display.setFont(u8g2_font_logisoso32_tf);
+
+  display.setCursor(0, 39);
+
+  if (isnan(temperatureC)) {
+    display.print("--");
+  } else {
+    display.print(temperatureC, 1);
+  }
+
+  display.setFont(u8g2_font_7x13B_tf);
+  display.setCursor(103, 36);
+  display.print("C");
+
+  display.setFont(u8g2_font_5x8_tf);
+  display.setCursor(2, 48);
+
+  if (isnan(temperatureC)) {
+    display.print("CHECK DS18B20");
+  } else if (temperatureC < 5) {
+    display.print("TOO COLD FOR MOST SEEDS");
+  } else if (temperatureC < 10) {
+    display.print("COOL - GERMINATION SLOW");
+  } else if (temperatureC < 26) {
+    display.print("GOOD FOR MOST ROOTS");
+  } else {
+    display.print("WARM - WATCH MOISTURE");
+  }
+
+  drawMiniGraph(
+    tempHistory,
+    historyCount,
+    0,
+    41,
+    128,
+    13
+  );
+}
+
+void drawPHScreen() {
+  drawTab("pH");
+
+  display.setFont(u8g2_font_logisoso32_tf);
+
+  display.setCursor(0, 39);
+
+  if (isnan(phValue)) {
+    display.print("--");
+  } else {
+    display.print(phValue, 2);
+  }
+
+  display.setFont(u8g2_font_5x8_tf);
+  display.setCursor(2, 48);
+
+  if (isnan(phValue)) {
+    display.print("CHECK pH PROBE / CALIBRATION");
+  } else if (phValue < 5.5) {
+    display.print("STRONGLY ACIDIC");
+  } else if (phValue < 6.0) {
+    display.print("ACIDIC");
+  } else if (phValue < 7.1) {
+    display.print("GOOD FOR MOST PLANTS");
+  } else if (phValue < 7.9) {
+    display.print("SLIGHTLY ALKALINE");
+  } else {
+    display.print("ALKALINE");
+  }
+
+  drawMiniGraph(
+    phHistory,
+    historyCount,
+    0,
+    41,
+    128,
+    13
+  );
+}
+
+void drawCompactionScreen() {
+  drawTab("COMPACTION");
+
+  display.setFont(u8g2_font_logisoso28_tf);
+
+  display.setCursor(0, 39);
+
+  if (isnan(peakKpa)) {
+    display.print("---");
+  } else {
+    display.print(peakKpa, 0);
+  }
+
+  display.setFont(u8g2_font_5x8_tf);
+  display.setCursor(91, 27);
+  display.print("kPa");
+
+  display.setCursor(91, 38);
+  display.print("DEPTH");
+
+  display.setCursor(91, 48);
+  display.print(currentDepth, 0);
+  display.print("cm");
+
+  drawCompactionGraph();
+
+  if (pushing) {
+    display.drawBox(65, 0, 24, 10);
+
+    display.setDrawColor(0);
+
+    display.setFont(u8g2_font_5x8_tf);
+
+    display.drawStr(67, 8, "PUSH");
+
+    display.setDrawColor(1);
+  }
+}
+
+void drawTab(const char* title) {
+  display.setFont(u8g2_font_6x10B_tf);
+
+  display.drawStr(0, 18, title);
+
+  display.drawBox(0, 20, 35, 2);
+}
+
+// ================================================================
+// MINI TREND GRAPH
+// ================================================================
+
+void drawMiniGraph(
+  float values[],
+  int count,
+  int x,
+  int y,
+  int w,
+  int h
+) {
+  if (count < 2) {
+    return;
+  }
+
+  float minV = values[0];
+  float maxV = values[0];
+
+  for (int i = 0; i < count; i++) {
+    if (isnan(values[i])) continue;
+
+    minV = min(minV, values[i]);
+    maxV = max(maxV, values[i]);
+  }
+
+  if (maxV - minV < 0.01) {
+    maxV = minV + 1;
+  }
+
+  int lastX = x;
+  int lastY = y + h;
+
+  for (int i = 0; i < count; i++) {
+    if (isnan(values[i])) continue;
+
+    int px =
+      x + (i * (w - 1)) / max(1, count - 1);
+
+    int py =
+      y + h -
+      ((values[i] - minV) / (maxV - minV)) * h;
+
+    if (i > 0) {
+      display.drawLine(
+        lastX,
+        lastY,
+        px,
+        py
+      );
+    }
+
+    lastX = px;
+    lastY = py;
+  }
+}
+
+// ================================================================
+// COMPACTION PROFILE GRAPH
+// ================================================================
+
+void drawCompactionGraph() {
+  if (depthCount < 1) {
+    return;
+  }
+
+  const int gx = 48;
+  const int gy = 42;
+  const int gw = 42;
+  const int gh = 12;
+
+  display.drawFrame(
+    gx,
+    gy,
+    gw,
+    gh
+  );
+
+  for (int i = 1; i < depthCount; i++) {
+    float x1 =
+      gx +
+      (i - 1) * (gw - 2) /
+      max(1, depthCount - 1);
+
+    float x2 =
+      gx +
+      i * (gw - 2) /
+      max(1, depthCount - 1);
+
+    float y1 =
+      gy + gh - 2 -
+      constrain(
+        peakPoints[i - 1] / 3000.0f,
+        0.0f,
+        1.0f
+      ) * (gh - 4);
+
+    float y2 =
+      gy + gh - 2 -
+      constrain(
+        peakPoints[i] / 3000.0f,
+        0.0f,
+        1.0f
+      ) * (gh - 4);
+
+    display.drawLine(
+      x1,
+      y1,
+      x2,
+      y2
+    );
+  }
+}
+
+// ================================================================
+// DANCING LORAX
+// ================================================================
+
+void updateLorax() {
+  if (
+    !loraxPaused &&
+    millis() - loraxFrameTime >= LORAX_FRAME_MS
+  ) {
+    loraxFrameTime = millis();
+    loraxFrame = (loraxFrame + 1) % 4;
+  }
+
+  drawLorax();
+}
+
+void drawLorax() {
+  const int x = LORAX_X;
+  const int y = LORAX_Y;
+
+  display.drawHLine(
+    x - 10,
+    y + 17,
+    20
+  );
+
+  int bounce =
+    loraxPaused
+      ? 0
+      : ((loraxFrame == 1 || loraxFrame == 3) ? -2 : 0);
+
+  // Body/head
+  display.drawDisc(
+    x,
+    y + bounce,
+    7
+  );
+
+  // Feet
+  if (
+    loraxFrame == 1 ||
+    loraxFrame == 3
+  ) {
+    display.drawDisc(
+      x - 7,
+      y + 9,
+      3
+    );
+
+    display.drawDisc(
+      x + 5,
+      y + 8,
+      3
+    );
+  } else {
+    display.drawDisc(
+      x - 5,
+      y + 9,
+      3
+    );
+
+    display.drawDisc(
+      x + 7,
+      y + 9,
+      3
+    );
+  }
+
+  // Arms
+  if (
+    loraxFrame == 0 ||
+    loraxFrame == 2
+  ) {
+    display.drawLine(
+      x - 6,
+      y - 1 + bounce,
+      x - 11,
+      y - 7 + bounce
+    );
+
+    display.drawLine(
+      x + 6,
+      y - 1 + bounce,
+      x + 11,
+      y - 7 + bounce
+    );
+  } else {
+    display.drawLine(
+      x - 6,
+      y - 1 + bounce,
+      x - 11,
+      y + 5 + bounce
+    );
+
+    display.drawLine(
+      x + 6,
+      y - 1 + bounce,
+      x + 11,
+      y + 5 + bounce
+    );
+  }
+
+  // Sprout
+  display.drawLine(
+    x,
+    y - 7 + bounce,
+    x,
+    y - 13 + bounce
+  );
+
+  display.drawLine(
+    x,
+    y - 12 + bounce,
+    x - 4,
+    y - 15 + bounce
+  );
+
+  display.drawLine(
+    x,
+    y - 11 + bounce,
+    x + 4,
+    y - 14 + bounce
+  );
+
+  // Eyes
+  display.setDrawColor(0);
+
+  display.drawDisc(
+    x - 3,
+    y - 2 + bounce,
+    1
+  );
+
+  display.drawDisc(
+    x + 3,
+    y - 2 + bounce,
+    1
+  );
+
+  // Mustache
+  display.drawLine(
+    x,
+    y + 3 + bounce,
+    x - 4,
+    y + 1 + bounce
+  );
+
+  display.drawLine(
+    x,
+    y + 3 + bounce,
+    x - 7,
+    y + 4 + bounce
+  );
+
+  display.drawLine(
+    x,
+    y + 3 + bounce,
+    x + 4,
+    y + 1 + bounce
+  );
+
+  display.drawLine(
+    x,
+    y + 3 + bounce,
+    x + 7,
+    y + 4 + bounce
+  );
+
+  display.setDrawColor(1);
+
+  // Music notes
+  if (!loraxPaused) {
+    display.setFont(u8g2_font_5x8_tf);
+
+    if (loraxFrame == 0) {
+      display.drawStr(
+        x - 15,
+        y - 14,
+        "*"
+      );
+    } else if (loraxFrame == 2) {
+      display.drawStr(
+        x + 10,
+        y - 13,
+        "*"
+      );
+    }
+  }
+}
+
+// ================================================================
+// SPLASH / TOAST
+// ================================================================
+
+void drawSplash() {
+  display.clearBuffer();
+
+  display.setFont(u8g2_font_logisoso20_tf);
+  display.drawStr(
+    0,
+    24,
+    "SOIL"
+  );
+
+  display.setFont(u8g2_font_logisoso20_tf);
+  display.drawStr(
+    0,
+    48,
+    "PROBE"
+  );
+
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(
+    82,
+    62,
+    "LIVE"
+  );
+
+  display.sendBuffer();
+}
+
+void drawToast(const char* message) {
+  display.clearBuffer();
+
+  display.drawFrame(
+    0,
+    20,
+    128,
+    25
+  );
+
+  display.setFont(
+    u8g2_font_6x10B_tf
+  );
+
+  int width =
+    display.getStrWidth(message);
+
+  display.drawStr(
+    max(1, (128 - width) / 2),
+    36,
+    message
+  );
+
+  display.sendBuffer();
+}
+
+// ================================================================
+// OPTIONAL SERIAL CSV EXPORT
+// ================================================================
+
+/*
+  Open Serial Monitor at 115200 baud.
+
+  Arduino outputs:
+
+    READING,time,temp,pH
+    PUSH,depth,kPa
+    DEPTH,depth
+    ZERO
+
+  For physical CSV storage, add an SD card module.
+*/
+
+// ================================================================
+// END
+// ================================================================
