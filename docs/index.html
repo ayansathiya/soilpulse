@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Soil Probe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&display=swap" rel="stylesheet">
+<style>
+:root{--baja:#2FE0C2;--mint:#DFFBF5;--dim:rgba(47,224,194,.3);--line:rgba(47,224,194,.22)}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:#000;color:var(--mint);font-family:"Bricolage Grotesque","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:3px solid var(--baja);outline-offset:3px}
+.app{min-height:100%;display:grid;grid-template-rows:auto 1fr auto;padding:20px clamp(16px,3vw,40px)}
+header{display:flex;justify-content:space-between;align-items:center;gap:16px}
+.brand{display:flex;align-items:center;gap:14px;font-weight:600;font-size:18px;letter-spacing:-.01em}
+.mono{width:44px;height:44px;border:2px solid var(--baja);border-radius:50%;display:grid;place-items:center;color:var(--baja);font-weight:800;font-size:16px}
+.status{display:flex;align-items:center;gap:12px;font-size:14px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim)}
+.live .dot{background:var(--baja);box-shadow:0 0 12px var(--baja)}
+.btn{border:1.5px solid var(--baja);color:var(--baja);background:transparent;border-radius:999px;padding:11px 20px;font-weight:600;transition:background .15s,color .15s}
+.btn:hover{background:var(--baja);color:#000}
+.btn.primary{background:var(--baja);color:#000}
+.btn.primary:hover{background:var(--mint);border-color:var(--mint)}
+.btn.small{padding:8px 14px;font-size:14px}
+main{display:grid;grid-template-columns:minmax(260px,.9fr) 1.7fr;gap:clamp(24px,4vw,72px);padding:clamp(20px,5vh,64px) 0}
+#list{display:flex;flex-direction:column;align-items:flex-start}
+.item{display:flex;align-items:baseline;gap:16px;background:none;border:0;text-align:left;padding:0;font-weight:800;font-size:clamp(40px,6.2vw,92px);line-height:1.02;letter-spacing:-.045em;color:var(--dim);transition:color .2s}
+.item:hover,.item[aria-current=true]{color:var(--baja)}
+.item .v{font-size:clamp(14px,1.3vw,19px);font-weight:600;letter-spacing:0;color:var(--mint);opacity:.85}
+.stage{position:relative;min-width:0}
+.big{font-weight:800;font-size:clamp(110px,18vw,270px);line-height:.85;letter-spacing:-.065em;color:var(--baja);font-variant-numeric:tabular-nums}
+.unit{font-size:clamp(20px,2.4vw,34px);font-weight:600;letter-spacing:0;color:var(--mint);margin-left:.35em}
+.verdict{margin-top:22px;max-width:30ch;font-size:clamp(20px,2vw,28px);line-height:1.2;font-weight:600;letter-spacing:-.015em}
+.hint{margin-top:10px;max-width:46ch;font-size:15px;line-height:1.45;opacity:.6}
+.chart{margin-top:30px;padding-top:16px;border-top:1px solid var(--line);color:var(--baja)}
+.chart svg{display:block;width:100%;height:auto;max-height:260px}
+.chart .cap{margin-top:8px;font-size:13px;color:var(--mint);opacity:.6}
+.chart text{fill:var(--mint);opacity:.6;font-size:11px;font-family:inherit}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}
+footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:13px;opacity:.55}
+#mascot{position:absolute;top:0;right:0;width:clamp(56px,7vw,88px)}
+#mascot.hop{animation:hop .5s ease-out}
+@keyframes hop{0%,100%{transform:translateY(0)}40%{transform:translateY(-16px) rotate(-4deg)}70%{transform:translateY(0) rotate(3deg)}}
+#loader{position:fixed;inset:0;z-index:50;background:#000;display:flex;flex-direction:column;justify-content:space-between;padding:24px clamp(16px,3vw,40px);transition:opacity .7s ease}
+#loader.done{opacity:0;pointer-events:none}
+#loader p{font-size:16px;font-weight:600}
+#pct{font-weight:800;font-size:clamp(120px,26vw,380px);line-height:.8;letter-spacing:-.07em;color:var(--baja);font-variant-numeric:tabular-nums}
+#toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,20px);opacity:0;background:#000;border:1.5px solid var(--baja);color:var(--mint);padding:12px 18px;border-radius:14px;max-width:min(92vw,460px);font-size:14px;transition:.25s;pointer-events:none;z-index:40}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:760px){main{grid-template-columns:1fr}.item{font-size:clamp(40px,13vw,64px)}#mascot{top:-4px}}
+@media(prefers-reduced-motion:reduce){#loader,#toast{transition:none}#mascot.hop{animation:none}}
+</style>
+</head>
+<body>
+
+<div id="loader" aria-hidden="true"><p>Warming up the probe</p><div id="pct">0</div></div>
+
+<div class="app">
+  <header>
+    <div class="brand"><span class="mono">SP</span>Soil Probe</div>
+    <div class="status" id="status">
+      <span class="dot"></span><span id="mode">Demo data</span>
+      <button class="btn small" id="connect">Connect Arduino</button>
+    </div>
+  </header>
+
+  <main>
+    <nav id="list" aria-label="Measurements"></nav>
+    <section class="stage" aria-live="polite">
+      <svg id="mascot" viewBox="0 0 100 100" role="img" aria-label="Mustached forest mascot">
+        <path d="M50 30V16" stroke="#2FE0C2" stroke-width="3" stroke-linecap="round" fill="none"/>
+        <path d="M50 20C50 8 38 6 32 10C34 18 42 22 50 20Z" fill="#2FE0C2"/>
+        <path d="M50 18C52 8 62 4 69 8C66 16 58 20 50 18Z" fill="#2FE0C2"/>
+        <ellipse cx="50" cy="60" rx="31" ry="30" fill="#2FE0C2"/>
+        <ellipse cx="38" cy="92" rx="10" ry="5" fill="#2FE0C2"/><ellipse cx="62" cy="92" rx="10" ry="5" fill="#2FE0C2"/>
+        <path d="M30 44Q38 38 46 45M70 44Q62 38 54 45" stroke="#000" stroke-width="4" stroke-linecap="round" fill="none"/>
+        <circle cx="39" cy="51" r="4.5" fill="#000"/><circle cx="61" cy="51" r="4.5" fill="#000"/>
+        <path d="M50 60C42 52 24 55 17 68C28 66 38 72 50 67C62 72 72 66 83 68C76 55 58 52 50 60Z" fill="#000"/>
+      </svg>
+      <div class="big"><span id="big">—</span><span class="unit" id="unit"></span></div>
+      <p class="verdict" id="verdict">Take a reading to start.</p>
+      <p class="hint" id="hint"></p>
+      <div class="chart" id="chart"></div>
+      <div class="actions" id="actions"></div>
+    </section>
+  </main>
+
+  <footer><span id="meta">No readings yet</span><span>pH measured in a 1:5 soil–water slurry</span></footer>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const rand=(a,b)=>a+Math.random()*(b-a);
+const ok=v=>typeof v==='number'&&isFinite(v);
+const S={sel:'temp',readings:[],peaks:{},live:false,pushing:false,port:null,writer:null,demoDepth:0,demoTimer:null};
+
+const SENSORS={
+  temp:{name:'Temperature',unit:'°C',dec:1,get:()=>last('temp'),
+    verdict:v=>v<5?'Too cold for most seeds to germinate.':v<10?'Cool. Germination will be slow.':v<26?'Good for most seeds and roots.':'Warm. Watch soil moisture.',
+    hint:'Used to correct the pH reading.'},
+  ph:{name:'pH',unit:'',dec:2,get:()=>last('ph'),
+    verdict:v=>v<5.5?'Strongly acidic. Most crops struggle.':v<6?'Acidic. Fine for blueberries, tough for most vegetables.':v<7.1?'Slightly acidic to neutral. Good for most plants.':v<7.9?'Slightly alkaline. Fine for most plants.':'Alkaline. Iron and phosphorus get harder to absorb.',
+    hint:'Measured in a soil–distilled water slurry, not dry soil.'},
+  comp:{name:'Compaction',unit:'kPa',dec:0,get:()=>{const p=Object.values(S.peaks);return p.length?Math.max(...p):undefined},
+    verdict:v=>v<1000?'Loose. Roots move freely.':v<2000?'Firm. Roots are slowed.':'Compacted. Roots struggle past 2000 kPa.',
+    hint:'Peak cone index so far. Push steadily and mark every 5 cm.'}
+};
+const last=k=>{const r=S.readings.at(-1);return r?r[k]:undefined};
+const fmt=(s,v)=>ok(v)?v.toFixed(s.dec):'—';
+
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('show'),3400)}
+function hop(){const m=$('#mascot');m.classList.remove('hop');void m.getBoundingClientRect();m.classList.add('hop')}
+
+/* ---------- rendering ---------- */
+function render(){
+  $('#list').innerHTML=Object.entries(SENSORS).map(([k,s])=>
+    `<button class="item" data-k="${k}" ${k===S.sel?'aria-current="true"':''}>${s.name}<span class="v">${fmt(s,s.get())}${ok(s.get())?' '+s.unit:''}</span></button>`).join('');
+  const s=SENSORS[S.sel],v=s.get();
+  $('#big').textContent=fmt(s,v);
+  $('#unit').textContent=ok(v)?s.unit:'';
+  $('#verdict').textContent=ok(v)?s.verdict(v):(S.sel==='comp'?'Start a push to measure compaction.':'Take a reading to start.');
+  $('#hint').textContent=s.hint;
+  $('#chart').innerHTML=S.sel==='comp'?profile():trend();
+  const comp=S.sel==='comp';
+  $('#actions').innerHTML=comp
+    ?`<button class="btn primary" data-a="push">${S.pushing?'Pushing…':'Start push'}</button><button class="btn" data-a="next">Next 5 cm</button><button class="btn" data-a="stop">Stop</button><button class="btn" data-a="zero">Zero load cell</button><button class="btn" data-a="csv">Download CSV</button>`
+    :`<button class="btn primary" data-a="read">Take reading</button><button class="btn" data-a="csv">Download CSV</button>`;
+  const n=S.readings.length;
+  $('#meta').textContent=n?`${n} reading${n>1?'s':''}, last at ${S.readings.at(-1).time}`:'No readings yet';
+}
+
+function trend(){
+  const key={temp:'temp',ph:'ph'}[S.sel];
+  const vals=S.readings.map(r=>r[key]).filter(ok).slice(-20);
+  if(vals.length<2)return'<p class="cap">Take two readings to see a trend.</p>';
+  const W=600,H=140,mn=Math.min(...vals),mx=Math.max(...vals),r=(mx-mn)||1;
+  const d=vals.map((v,i)=>(i?'L':'M')+(i/(vals.length-1)*W).toFixed(1)+' '+(H-8-(v-mn)/r*(H-24)).toFixed(1)).join('');
+  const s=SENSORS[S.sel];
+  return`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Trend of recent readings"><path d="${d}" fill="none" stroke="currentColor" stroke-width="2.5" vector-effect="non-scaling-stroke"/></svg><p class="cap">Last ${vals.length} readings, from ${mn.toFixed(s.dec)} to ${mx.toFixed(s.dec)} ${s.unit}</p>`;
+}
+
+function profile(){
+  const ds=Object.keys(S.peaks).map(Number).sort((a,b)=>a-b);
+  if(!ds.length)return'<p class="cap">Press Start push, then Next 5 cm each time the cone passes another 5 cm.</p>';
+  const W=600,H=260,L=44,R=12,T=14,B=26;
+  const xmax=Math.max(3000,...Object.values(S.peaks))*1.05,ymax=Math.max(30,ds.at(-1)+5);
+  const X=v=>L+v/xmax*(W-L-R),Y=d=>T+d/ymax*(H-T-B);
+  let g='';
+  for(let x=0;x<=3000;x+=1000)g+=`<text x="${X(x)}" y="${H-8}" text-anchor="middle">${x}</text>`;
+  for(let y=0;y<=ymax;y+=10)g+=`<text x="${L-8}" y="${Y(y)+4}" text-anchor="end">${y}</text><line x1="${L}" x2="${W-R}" y1="${Y(y)}" y2="${Y(y)}" stroke="currentColor" opacity=".12"/>`;
+  const pts=ds.map(d=>[X(S.peaks[d]),Y(d)]);
+  const path=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join('');
+  return`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Cone index by depth">${g}
+  <line x1="${X(2000)}" x2="${X(2000)}" y1="${T}" y2="${H-B}" stroke="currentColor" stroke-dasharray="5 5" opacity=".7"/>
+  <text x="${X(2000)+6}" y="${T+10}">Roots struggle</text>
+  <path d="${path}" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+  ${pts.map(p=>`<circle cx="${p[0]}" cy="${p[1]}" r="4" fill="currentColor"/>`).join('')}</svg>
+  <p class="cap">Cone index (kPa) across, depth (cm) down</p>`;
+}
+
+/* ---------- data in ---------- */
+function addReading(r){r.time=new Date().toLocaleTimeString();S.readings.push(r);hop();render()}
+function addPush(d,n,k){if(!ok(d)||!ok(k))return;S.peaks[d]=Math.max(S.peaks[d]||0,k);S.depth=d;if(!addPush.q){addPush.q=1;requestAnimationFrame(()=>{addPush.q=0;render()})}}
+function handleLine(l){
+  if(!l||!/^[-\d.,naif]+$/i.test(l))return;
+  const p=l.split(',').map(parseFloat);
+  if(p.length===2)addReading({temp:p[0],ph:p[1]});
+  else if(p.length===3)addPush(p[0],p[1],p[2]);
+}
+
+/* ---------- commands out ---------- */
+async function send(c){
+  if(S.live){try{await S.writer.write(c)}catch(e){toast('Lost the connection to the Arduino.');drop()}return}
+  if(c==='r')setTimeout(()=>addReading({temp:rand(12,22),ph:rand(5.8,7.4)}),450);
+  if(c==='p'){S.demoDepth=0;clearInterval(S.demoTimer);S.demoTimer=setInterval(()=>addPush(S.demoDepth,0,Math.max(0,250+S.demoDepth*60+rand(-130,130))),100)}
+  if(c==='n')S.demoDepth+=5;
+  if(c==='x')clearInterval(S.demoTimer);
+  if(c==='z')toast('Zeroed (demo)');
+}
+function act(a){
+  if(a==='read')send('r');
+  if(a==='push'){S.peaks={};S.pushing=true;send('p');render()}
+  if(a==='next')send('n');
+  if(a==='stop'){S.pushing=false;send('x');render()}
+  if(a==='zero'){if(S.pushing)return toast('Stop the push first, then zero with nothing on the cone.');send('z')}
+  if(a==='csv')csv();
+}
+
+/* ---------- serial ---------- */
+async function connect(){
+  if(S.live)return drop(true);
+  if(!('serial' in navigator))return toast('Live mode needs Chrome or Edge on a computer. Demo data keeps running.');
+  try{
+    const port=await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+    const enc=new TextEncoderStream();enc.readable.pipeTo(port.writable);
+    const dec=new TextDecoderStream();port.readable.pipeTo(dec.writable);
+    S.port=port;S.writer=enc.writable.getWriter();S.live=true;
+    clearInterval(S.demoTimer);S.readings=[];S.peaks={};S.pushing=false;
+    status();render();toast('Connected. Press Take reading.');
+    pump(dec.readable.getReader());
+  }catch(e){toast('Could not open the port. Close the Arduino Serial Monitor and try again.')}
+}
+async function pump(rd){let buf='';try{for(;;){const{value,done}=await rd.read();if(done)break;buf+=value;let i;while((i=buf.indexOf('\n'))>=0){handleLine(buf.slice(0,i).trim());buf=buf.slice(i+1)}}}catch(e){}drop()}
+async function drop(user){
+  const p=S.port;S.live=false;S.port=null;S.writer=null;S.pushing=false;
+  try{if(p)await p.close()}catch(e){}
+  status();render();if(!user)toast('Arduino disconnected. Back to demo data.');
+}
+function status(){$('#status').classList.toggle('live',S.live);$('#mode').textContent=S.live?'Live from Arduino':'Demo data';$('#connect').textContent=S.live?'Disconnect':'Connect Arduino'}
+
+/* ---------- export ---------- */
+function csv(){
+  if(!S.readings.length&&!Object.keys(S.peaks).length)return toast('Nothing to download yet.');
+  let t='time,temp_C,pH\n'+S.readings.map(r=>[r.time,r.temp,r.ph].join(',')).join('\n');
+  t+='\n\ndepth_cm,peak_cone_index_kPa\n'+Object.keys(S.peaks).map(d=>d+','+S.peaks[d].toFixed(0)).join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='soil-probe-log.csv';a.click();
+}
+
+/* ---------- wiring ---------- */
+$('#list').addEventListener('click',e=>{const b=e.target.closest('.item');if(b){S.sel=b.dataset.k;render()}});
+$('#actions').addEventListener('click',e=>{const b=e.target.closest('[data-a]');if(b)act(b.dataset.a)});
+$('#connect').addEventListener('click',connect);
+
+/* ---------- one orchestrated moment: the loader ---------- */
+(function boot(){
+  const L=$('#loader'),P=$('#pct');status();render();
+  const finish=()=>{L.classList.add('done');setTimeout(()=>L.remove(),800);send('r')};
+  if(matchMedia('(prefers-reduced-motion:reduce)').matches){L.remove();send('r');return}
+  const t0=performance.now(),D=1900;
+  (function tick(now){const p=Math.min(1,(now-t0)/D),e=1-Math.pow(1-p,3);P.textContent=Math.round(e*100);p<1?requestAnimationFrame(tick):setTimeout(finish,250)})(t0);
+})();
+</script>
+</body>
+</html>
