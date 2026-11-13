@@ -9,9 +9,11 @@
   HX711 (Bogdan Necula), U8g2 (olikraus)
 
   OLED pages:  Temp  |  pH  |  Compact
-    - Pages auto-switch every few seconds (see AUTO_CYCLE_MS).
-    - Optional button on D7 (to GND): short press = next page,
-      hold for 1 second = zero the load cell and reset the peak.
+    - The screen follows the probe you are using: when the temperature jumps
+      (probe goes into the soil) it shows Temp, when the pH moves it shows pH,
+      and it stays there. Tune TEMP_FOCUS_DELTA / PH_FOCUS_DELTA below.
+    - Button on D8 (to GND): short press = reset the reading (restarts
+      "Detecting..." and measures again), hold for 1 second = next page.
 
   Serial (115200 baud) / dashboard commands:
     r        reading: prints "temp_C,pH" then the values
@@ -25,7 +27,7 @@
     HX711     VCC->5V, GND->GND, DT->D3, SCK->D4 (load cell wires to E+/E-/A+/A-)
     pH board  V+->5V, G->GND, Po->A0
     OLED      VCC->3.3V, GND->GND, SDA->A4, SCL->A5
-    Button    (optional) D7 to GND
+    Button    D8 to GND
 */
 
 #include <Wire.h>
@@ -43,7 +45,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 const uint8_t PIN_ONEWIRE = 2;
 const uint8_t PIN_HX_DT   = 3;
 const uint8_t PIN_HX_SCK  = 4;
-const uint8_t PIN_BTN     = 7;
+const uint8_t PIN_BTN     = 8;
 const uint8_t PIN_PH      = A0;
 
 // ---------------- Calibration constants (edit after calibrating) ----------------
@@ -54,7 +56,9 @@ float PH_V7 = 2.50f;                // volts at pH 7  (from the 'w' command)
 float PH_V4 = 3.00f;                // volts at pH 4
 const float PH_CAL_TEMP_C = 25.0f;  // temperature your buffers were at
 
-const uint32_t AUTO_CYCLE_MS = 6000; // switch OLED page every 6 s (0 = never)
+const uint32_t AUTO_CYCLE_MS = 0;    // 0 = never auto-switch (screen follows the active probe)
+const float TEMP_FOCUS_DELTA = 1.0f; // temp change (C) that pulls the screen to the Temp page
+const float PH_FOCUS_DELTA   = 0.4f; // pH change that pulls the screen to the pH page
 
 // ---------------- State ----------------
 const float ADC_MAX = 16383.0f;     // 14-bit ADC
@@ -67,6 +71,8 @@ bool hxOK = false;
 
 float coneKPa = 0, peakKPa = 0;
 float tempC = NAN, phVal = NAN, prevTemp = NAN;
+float tempAnchor = NAN, phAnchor = NAN;   // last values that moved the screen focus
+uint32_t graceUntil = 0;                  // ignore focus changes right after boot
 uint8_t phStableCount = 0, tempStableCount = 0;
 
 uint8_t page = 0;                   // 0 = Temp, 1 = pH, 2 = Compact
@@ -92,6 +98,29 @@ float readPH(float tempC) {
   return 7.0f + (v - PH_V7) / (voltsPerPH * scaleT);
 }
 
+// Throw out impossible DS18B20 values instead of showing them:
+//  -127 = sensor not found / bad data wire, 85.0 = not finished measuring yet
+float cleanTemp(float t) {
+  if (t == DEVICE_DISCONNECTED_C) return NAN;
+  if (t < -55.0f || t > 125.0f) return NAN;
+  if (t == 85.0f) return NAN;
+  return t;
+}
+
+// The screen follows the probe you are using: a big change in a reading means
+// you just moved that probe, so show its page and stay there.
+void noteActivity(float cur, float &anchor, float delta, uint8_t pageIdx) {
+  if (isnan(cur)) return;
+  if (isnan(anchor)) { anchor = cur; return; }
+  if (fabs(cur - anchor) >= delta) {
+    anchor = cur;
+    if (millis() > graceUntil && !penActive && page != pageIdx) {
+      page = pageIdx;
+      lastPageChange = millis();
+    }
+  }
+}
+
 // Fresh temperature (waits for the conversion), then back to non-blocking mode
 float readTempBlocking() {
   sensors.setWaitForConversion(true);
@@ -99,7 +128,7 @@ float readTempBlocking() {
   float t = sensors.getTempCByIndex(0);
   sensors.setWaitForConversion(false);
   sensors.requestTemperatures();
-  return (t == DEVICE_DISCONNECTED_C) ? NAN : t;
+  return cleanTemp(t);
 }
 
 // Non-blocking: only reads the HX711 when a new sample is ready (10 per second).
@@ -114,23 +143,31 @@ bool updateCone() {
 }
 
 // Once a second: temperature, pH, and whether each has settled
+uint32_t lastSlow = 0;
 void updateSlow() {
-  static uint32_t last = 0;
-  if (millis() - last < 1000) return;
-  last = millis();
+  if (millis() - lastSlow < 1000) return;
+  lastSlow = millis();
 
   float t = sensors.getTempCByIndex(0);   // result of the previous request
+  tempC = cleanTemp(t);
+  if (isnan(tempC)) {                     // not found: look for it again (plug-in after boot)
+    sensors.begin();
+    sensors.setWaitForConversion(false);
+  }
   sensors.requestTemperatures();          // start the next one
-  tempC = (t == DEVICE_DISCONNECTED_C) ? NAN : t;
 
   bool tSteady = !isnan(tempC) && !isnan(prevTemp) && fabs(tempC - prevTemp) < 0.3f;
   tempStableCount = tSteady ? (tempStableCount < 9 ? tempStableCount + 1 : 9) : 0;
   prevTemp = tempC;
 
   float newPH = readPH(isnan(tempC) ? 25.0f : tempC);
-  bool pSteady = !isnan(phVal) && fabs(newPH - phVal) < 0.03f;
+  if (newPH < 0.0f || newPH > 14.0f) newPH = NAN;   // impossible: probe not in liquid / not calibrated
+  bool pSteady = !isnan(phVal) && !isnan(newPH) && fabs(newPH - phVal) < 0.03f;
   phStableCount = pSteady ? (phStableCount < 9 ? phStableCount + 1 : 9) : 0;
   phVal = newPH;
+
+  noteActivity(tempC, tempAnchor, TEMP_FOCUS_DELTA, 0);
+  noteActivity(phVal, phAnchor, PH_FOCUS_DELTA, 1);
 }
 
 // ---------------- Plain-language verdicts (max 25 characters) ----------------
@@ -239,9 +276,13 @@ void drawFrame() {
     }
   } else if (page == 1) {
     caption = "pH of soil slurry";
-    if (!isnan(phVal)) val = String(phVal, 2);
-    verdict = isnan(phVal) ? "" : phVerdict(phVal);
-    detecting = phStableCount < 2;
+    if (isnan(phVal)) {
+      verdict = "Check probe / calibrate";
+    } else {
+      val = String(phVal, 2);
+      verdict = phVerdict(phVal);
+      detecting = phStableCount < 2;
+    }
   } else {
     caption = "Peak cone index";
     unit = "kPa";
@@ -294,6 +335,22 @@ void nextPage(bool byButton) {
   if (byButton) autoUntil = millis() + 20000;     // pause auto-switching for 20 s
 }
 
+// Throw away the current reading and measure again from scratch
+void resetReading() {
+  phStableCount = 0;
+  tempStableCount = 0;
+  prevTemp = NAN;
+  phVal = NAN;
+  tempAnchor = NAN;
+  phAnchor = NAN;
+  peakKPa = 0;
+  coneKPa = 0;
+  lastSlow = 0;                                    // measure again right away
+  autoUntil = millis() + 20000;                    // stay on this page for a while
+  flashMsg = "Reading reset";
+  flashUntil = millis() + 1200;
+}
+
 void handleButton() {
   static bool down = false, longDone = false;
   static uint32_t t0 = 0;
@@ -302,12 +359,10 @@ void handleButton() {
     down = true; longDone = false; t0 = millis();
   } else if (pressed && down && !longDone && millis() - t0 >= 1000) {
     longDone = true;
-    tareAndReset();
-    flashMsg = "Zeroed";
-    flashUntil = millis() + 1200;
+    nextPage(true);
   } else if (!pressed && down) {
     down = false;
-    if (!longDone && millis() - t0 > 30) nextPage(true);
+    if (!longDone && millis() - t0 > 30) resetReading();
   }
 }
 
@@ -421,6 +476,7 @@ void setup() {
   }
 
   lastPageChange = millis();
+  graceUntil = millis() + 6000;                    // let readings settle before the screen follows probes
   Serial.println(F("Soil probe ready. Commands: r w z s<kg> p"));
 }
 
